@@ -1,0 +1,113 @@
+#!/bin/bash
+# Linux Certificate Enrollment Using NDES and SCEP
+##################################################################
+# This script is provided as an example for illustration only,
+# without warranty either expressed or implied, including, but not
+# limited to, the implied warranties of merchantability and/or
+# fitness for a particular purpose.
+##################################################################
+#
+# Insert the NDES Enrollment Password here.
+ndeskey=ABC123DEF456ABC789DEF012ABC
+# Insert the NDES server FQDN
+ndesserver=ndes.contoso.corp
+# CA Filename
+cafilename=contoso
+# Number of days ahead of cert expiration to renew
+warning_days=45
+shopt -s -o nounset
+
+# Create a log file directory
+if [ ! -d /var/log/pki/ndes ]; then
+    mkdir -p /var/log/pki/ndes/
+fi
+DTG=$(date +%Y%m%d%H%M)
+LOG=/var/log/pki/ndes/ndes-enrollment$DTG.log
+if [ ! -f $LOG ]; then
+    touch $LOG
+fi
+echo "Checking for required packages" 2>&1 >> $LOG
+if rpm -qa | grep epel-release  2>&1 > /dev/null;
+        then
+        echo "epel-release is installed." 2>&1 >> $LOG
+else
+    yum -y install epel-release 2>&1 >> $LOG
+fi
+if rpm -qa | grep sscep  2>&1 > /dev/null;
+        then
+        echo "sscep is installed." 2>&1 >> $LOG
+else
+    yum -y install sscep
+fi
+
+sed -i 's/KEYBITS=1024/KEYBITS=2048/g' /usr/bin/mkrequest
+
+if [ ! -f /etc/pki/tls/certs/$(hostname).crt ] ; then
+        echo "$(hostname) does not have an existing certificate.  Executing initial enrollment." 2>&1 >> $LOG
+        echo "Requesting CA certificate chain." 2>&1 >> $LOG
+        sscep getca -c /etc/pki/ca-trust/source/anchors/${cafilename}CA.crt -u http://${ndesserver}/certsrv/mscep/mscep.dll/pkiclient.exe? 2>&1 >> $LOG
+        echo "Adding the CA chain to the host CA trusted chain." 2>&1 >> $LOG
+        update-ca-trust extract 2>&1 >> $LOG
+        echo "Generating CSR." 2>&1 >> $LOG
+        mkrequest -dns $(hostname) $ndeskey 2>&1 >> $LOG
+        echo "Moving CSR and new private key."  2>&1 >> $LOG
+        mv local.key /etc/pki/tls/private/$(hostname).key
+        mv local.csr /etc/pki/tls/private/local.csr
+        echo "Executing enrollment using NDES key."  2>&1 >> $LOG
+        sscep enroll -c /etc/pki/ca-trust/source/anchors/${cafilename}CA.crt-0 -e /etc/pki/ca-trust/source/anchors/${cafilename}CA.crt-1 -k /etc/pki/tls/private/$(hostname).key -r /etc/pki/tls/private/local.csr -l /etc/pki/tls/private/$(hostname).crt -u http://${ndesserver}/certsrv/mscep/mscep.dll/pkiclient.exe? -d -v 2>&1 >> $LOG
+        echo "Checking generated certificate status."  2>&1 >> $LOG
+        CERTSTATUS=$(openssl verify /etc/pki/tls/private/$(hostname).crt | cut -d: -f2)
+        if [ $CERTSTATUS == "OK" ]; then
+                echo "Certificate status is: " $CERTSTATUS 2>&1 >> $LOG
+                echo "Copying new certificate to /etc/pki/tls/certs/$(hostname).crt" 2>&1 >> $LOG
+                cp /etc/pki/tls/private/$(hostname).crt /etc/pki/tls/certs/$(hostname).crt 2>&1 >> $LOG
+        else
+                echo "The certificate is not valid per $CERTSTATUS"  2>&1 >> $LOG
+        fi
+else
+        output=$(openssl x509 -in /etc/pki/tls/certs/$(hostname).crt -noout -subject -dates 2>/dev/null)
+        cert=$(echo $output | sed 's/.*CN=\(.*\).*not.*/\1/g')
+        start_date=$(echo $output | sed 's/.*notBefore=\(.*\).*not.*/\1/g')
+        end_date=$(echo $output | sed 's/.*notAfter=\(.*\)$/\1/g')
+        start_epoch=$(date +%s -d "$start_date")
+        end_epoch=$(date +%s -d "$end_date")
+        epoch_now=$(date +%s)
+        if [ "$start_epoch" -gt "$epoch_now" ]; then
+                echo "Certificate for [$cert] is not yet valid" 2>&1 >> $LOG
+                echo $output
+        fi
+        seconds_to_expire=$(($end_epoch - $epoch_now))
+        days_to_expire=$(($seconds_to_expire / 86400))
+        echo "Days to expiry: ($days_to_expire)" 2>&1 >> $LOG
+        warning_seconds=$((86400 * $warning_days))
+        if [ "$seconds_to_expire" -lt 0 ]; then
+                echo "Certificate [$cert] has expired.  Remove the certificate and rerun to start a new enrollment."
+        else
+                if [ "$seconds_to_expire" -lt "$warning_seconds" ]; then
+                        echo "Certificate [$cert] is soon to expire ($seconds_to_expire seconds)"
+                        echo "Existing certificate found for $(hostname).  Executing re-enrollment." 2>&1 >> $LOG
+                        echo "Backing up current private key."  2>&1 >> $LOG
+                        mv -f /etc/pki/tls/private/$(hostname).crt /etc/pki/tls/private/$(hostname).crt.bak
+                        mv -f /etc/pki/tls/private/$(hostname).key /etc/pki/tls/private/$(hostname).key.bak
+                        echo "Generating CSR."  2>&1 >> $LOG
+                        mkrequest -dns $(hostname) 2>&1 >> $LOG
+                        echo "Moving CSR and new private key."  2>&1 >> $LOG
+                        mv -f local.key /etc/pki/tls/private/$(hostname).key
+                        mv -f local.csr /etc/pki/tls/private/local.csr
+                        echo "Executing enrollment using existing certificate."  2>&1 >> $LOG
+                        sscep enroll -c /etc/pki/ca-trust/source/anchors/${cafilename}CA.crt-0 -e /etc/pki/ca-trust/source/anchors/${cafilename}CA.crt-1 -k /etc/pki/tls/private/$(hostname).key -K /etc/pki/tls/private/$(hostname).key.bak -O /etc/pki/tls/private/$(hostname).crt.bak -r /etc/pki/tls/private/local.csr -l /etc/pki/tls/private/$(hostname).crt -u http://${ndesserver}/certsrv/mscep/mscep.dll/pkiclient.exe? -d -v  2>&1 >> $LOG
+                        echo "Checking generated certificate status."  2>&1 >> $LOG
+                        CERTSTATUS=$(openssl verify /etc/pki/tls/private/$(hostname).crt | cut -d: -f2)
+                        if [ $CERTSTATUS == "OK" ]; then
+                                echo "Certificate status is: " $CERTSTATUS 2>&1 >> $LOG
+                                echo "Copying new certificate to /etc/pki/tls/private/$(hostname).crt" 2>&1 >> $LOG
+                                cp -f /etc/pki/tls/private/$(hostname).crt /etc/pki/tls/certs/$(hostname).crt
+                        else
+                                echo "The certificate is not valid per $CERTSTATUS"  2>&1 >> $LOG
+                                echo "Restoring the backup existing certificate and keys."  2>&1 >> $LOG
+                                mv -f /etc/pki/tls/private/$(hostname).crt.bak /etc/pki/tls/private/$(hostname).crt
+                                mv -f /etc/pki/tls/private/$(hostname).key.bak /etc/pki/tls/private/$(hostname).key
+                        fi
+                fi
+        fi
+fi
